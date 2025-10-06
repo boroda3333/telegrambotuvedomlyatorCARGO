@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Токен бота из переменных окружения Railway
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '7952222222:AAE99unNb3eKLySt8vyj46nI9TEelX-KZZ4')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '7952222222:AAHNNBA5OnoQrblwY4BO0BoETb-9jZg_z_g')
 
 # Таймзона Москвы
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -1556,3 +1556,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
