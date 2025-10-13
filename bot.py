@@ -460,6 +460,7 @@ class PendingMessagesManager:
         return result
     
     def get_messages_for_funnel(self, funnel_number: int, funnels_state: FunnelsStateManager) -> List[Dict[str, Any]]:
+        """Получает сообщения для указанной воронки - СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ"""
         result = []
         now = datetime.now(MOSCOW_TZ)
         FUNNELS = self.funnels_config.get_funnels()
@@ -476,7 +477,9 @@ class PendingMessagesManager:
             current_funnel = message.get('current_funnel', 0)
             funnels_sent = message.get('funnels_sent', [])
             
+            # СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ ВОРОНОК
             if funnel_number == 1:
+                # Воронка 1: должно пройти больше 1 часа и не быть в других воронках
                 if (minutes_passed >= funnel_minutes and 
                     current_funnel == 0 and 
                     funnel_number not in funnels_sent):
@@ -485,22 +488,68 @@ class PendingMessagesManager:
                     result.append(message)
                     
             elif funnel_number == 2:
+                # Воронка 2: должно пройти больше 3 часов И воронка 1 уже была отправлена
                 if (minutes_passed >= funnel_minutes and 
                     1 in funnels_sent and 
+                    current_funnel == 1 and
                     funnel_number not in funnels_sent):
                     message['message_key'] = message_key
                     message['minutes_passed'] = minutes_passed
                     result.append(message)
                     
             elif funnel_number == 3:
+                # Воронка 3: должно пройти больше 5 часов И воронка 2 уже была отправлена
                 if (minutes_passed >= funnel_minutes and 
                     2 in funnels_sent and 
+                    current_funnel == 2 and
                     funnel_number not in funnels_sent):
                     message['message_key'] = message_key
                     message['minutes_passed'] = minutes_passed
                     result.append(message)
         
         return result
+    
+    def update_funnel_statuses(self):
+        """Автоматически обновляет статусы воронок на основе времени - СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ"""
+        updated_count = 0
+        now = datetime.now(MOSCOW_TZ)
+        FUNNELS = self.funnels_config.get_funnels()
+        
+        for message_key, message in self.pending_messages.items():
+            timestamp = datetime.fromisoformat(message['timestamp'])
+            time_diff = now - timestamp
+            minutes_passed = int(time_diff.total_seconds() / 60)
+            
+            current_funnel = message.get('current_funnel', 0)
+            funnels_sent = message.get('funnels_sent', [])
+            
+            # Определяем следующую воронку на основе времени и предыдущих воронок
+            next_funnel = current_funnel
+            
+            if current_funnel == 0 and minutes_passed >= FUNNELS[1]:
+                next_funnel = 1
+            elif current_funnel == 1 and minutes_passed >= FUNNELS[2]:
+                next_funnel = 2
+            elif current_funnel == 2 and minutes_passed >= FUNNELS[3]:
+                next_funnel = 3
+            
+            # Обновляем статус только если воронка изменилась
+            if next_funnel != current_funnel:
+                # Добавляем предыдущие воронки в список отправленных
+                for funnel_num in range(1, next_funnel):
+                    if funnel_num not in funnels_sent:
+                        funnels_sent.append(funnel_num)
+                
+                self.pending_messages[message_key]['current_funnel'] = next_funnel
+                self.pending_messages[message_key]['funnels_sent'] = funnels_sent
+                updated_count += 1
+                logger.info(f"🔄 Сообщение {message_key} перешло из воронки {current_funnel} в воронку {next_funnel} ({minutes_passed} минут прошло)")
+        
+        if updated_count > 0:
+            self.save_pending_messages()
+            logger.info(f"✅ Обновлено статусов воронок: {updated_count} сообщений")
+        
+        return updated_count
     
     def get_all_messages_older_than(self, minutes_threshold: int) -> List[Dict[str, Any]]:
         result = []
@@ -596,8 +645,9 @@ def format_time_ago(timestamp: str) -> str:
     now = datetime.now(MOSCOW_TZ)
     time_diff = now - message_time
     
-    hours = int(time_diff.total_seconds() / 3600)
-    minutes = int((time_diff.total_seconds() % 3600) / 60)
+    total_minutes = int(time_diff.total_seconds() / 60)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
     
     if hours > 0:
         return f"{hours}ч {minutes}м"
@@ -614,6 +664,35 @@ def minutes_to_hours_text(minutes: int) -> str:
         return "5 ЧАСОВ"
     else:
         return f"{hours} ЧАСОВ"
+
+# ========== ФУНКЦИИ АВТОМАТИЧЕСКОГО ОБНОВЛЕНИЯ ВОРОНОК ==========
+
+async def update_message_funnel_statuses():
+    """Автоматически обновляет статусы воронок для всех сообщений - СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ"""
+    logger.info("🔄 Автоматическое обновление статусов воронок...")
+    return pending_messages_manager.update_funnel_statuses()
+
+async def mark_messages_as_processed():
+    """Помечает все сообщения в текущих воронках как обработанные"""
+    processed_count = 0
+    
+    # Помечаем сообщения для каждой воронки как обработанные
+    for funnel_number in [1, 2, 3]:
+        messages = pending_messages_manager.get_messages_for_funnel(funnel_number, funnels_state_manager)
+        for message in messages:
+            message_key = message.get('message_key')
+            if message_key:
+                # Помечаем воронку как отправленную
+                pending_messages_manager.mark_funnel_sent(message_key, funnel_number)
+                # Помечаем сообщение как обработанное для этой воронки
+                funnels_state_manager.add_processed_message(funnel_number, message_key)
+                processed_count += 1
+                logger.info(f"✅ Сообщение {message_key} помечено как обработанное в воронке {funnel_number}")
+    
+    if processed_count > 0:
+        logger.info(f"✅ Помечено {processed_count} сообщений как обработанные")
+    
+    return processed_count
 
 # ========== СИСТЕМА ЕДИНОГО УВЕДОМЛЕНИЯ ==========
 
@@ -634,20 +713,41 @@ def create_master_notification_text() -> str:
     for msg in funnel_1_messages:
         chat_id = msg['chat_id']
         if chat_id not in funnel_1_chats:
-            funnel_1_chats[chat_id] = []
-        funnel_1_chats[chat_id].append(msg)
+            funnel_1_chats[chat_id] = {
+                'chat_info': msg,
+                'message_count': 0,
+                'oldest_time': msg['timestamp']
+            }
+        funnel_1_chats[chat_id]['message_count'] += 1
+        # Обновляем самое старое время
+        if msg['timestamp'] < funnel_1_chats[chat_id]['oldest_time']:
+            funnel_1_chats[chat_id]['oldest_time'] = msg['timestamp']
     
     for msg in funnel_2_messages:
         chat_id = msg['chat_id']
         if chat_id not in funnel_2_chats:
-            funnel_2_chats[chat_id] = []
-        funnel_2_chats[chat_id].append(msg)
+            funnel_2_chats[chat_id] = {
+                'chat_info': msg,
+                'message_count': 0,
+                'oldest_time': msg['timestamp']
+            }
+        funnel_2_chats[chat_id]['message_count'] += 1
+        # Обновляем самое старое время
+        if msg['timestamp'] < funnel_2_chats[chat_id]['oldest_time']:
+            funnel_2_chats[chat_id]['oldest_time'] = msg['timestamp']
     
     for msg in funnel_3_messages:
         chat_id = msg['chat_id']
         if chat_id not in funnel_3_chats:
-            funnel_3_chats[chat_id] = []
-        funnel_3_chats[chat_id].append(msg)
+            funnel_3_chats[chat_id] = {
+                'chat_info': msg,
+                'message_count': 0,
+                'oldest_time': msg['timestamp']
+            }
+        funnel_3_chats[chat_id]['message_count'] += 1
+        # Обновляем самое старое время
+        if msg['timestamp'] < funnel_3_chats[chat_id]['oldest_time']:
+            funnel_3_chats[chat_id]['oldest_time'] = msg['timestamp']
     
     # Создаем текст уведомления
     notification_text = "📊 **ОБЗОР НЕОТВЕЧЕННЫХ СООБЩЕНИЙ**\n\n"
@@ -655,33 +755,43 @@ def create_master_notification_text() -> str:
     # Воронка 1
     notification_text += f"🟡 {minutes_to_hours_text(FUNNELS[1])} без ответа\n"
     if funnel_1_chats:
-        for chat_id, messages in funnel_1_chats.items():
-            chat_display = get_chat_display_name(messages[0])
-            notification_text += f"{chat_display}\n"
+        for chat_id, chat_data in funnel_1_chats.items():
+            chat_display = get_chat_display_name(chat_data['chat_info'])
+            message_count = chat_data['message_count']
+            time_ago = format_time_ago(chat_data['oldest_time'])
+            notification_text += f"  • {chat_display} ({message_count} сообщ., {time_ago} назад)\n"
     else:
-        notification_text += "Таких нет\n"
+        notification_text += "  Таких нет\n"
     notification_text += "\n"
     
     # Воронка 2
     notification_text += f"🟠 {minutes_to_hours_text(FUNNELS[2])} без ответа\n"
     if funnel_2_chats:
-        for chat_id, messages in funnel_2_chats.items():
-            chat_display = get_chat_display_name(messages[0])
-            notification_text += f"{chat_display}\n"
+        for chat_id, chat_data in funnel_2_chats.items():
+            chat_display = get_chat_display_name(chat_data['chat_info'])
+            message_count = chat_data['message_count']
+            time_ago = format_time_ago(chat_data['oldest_time'])
+            notification_text += f"  • {chat_display} ({message_count} сообщ., {time_ago} назад)\n"
     else:
-        notification_text += "Таких нет\n"
+        notification_text += "  Таких нет\n"
     notification_text += "\n"
     
     # Воронка 3
     notification_text += f"🔴 БОЛЕЕ {minutes_to_hours_text(FUNNELS[3])} без ответа\n"
     if funnel_3_chats:
-        for chat_id, messages in funnel_3_chats.items():
-            chat_display = get_chat_display_name(messages[0])
-            notification_text += f"{chat_display}\n"
+        for chat_id, chat_data in funnel_3_chats.items():
+            chat_display = get_chat_display_name(chat_data['chat_info'])
+            message_count = chat_data['message_count']
+            time_ago = format_time_ago(chat_data['oldest_time'])
+            notification_text += f"  • {chat_display} ({message_count} сообщ., {time_ago} назад)\n"
     else:
-        notification_text += "Таких нет\n"
+        notification_text += "  Таких нет\n"
     
-    # Добавляем время обновления
+    # Добавляем общую статистику
+    total_messages = len(pending_messages_manager.get_all_pending_messages())
+    total_chats = len(set(msg['chat_id'] for msg in pending_messages_manager.get_all_pending_messages()))
+    
+    notification_text += f"\n📈 **ИТОГО:** {total_messages} сообщений в {total_chats} чатах"
     notification_text += f"\n⏰ Обновлено: {datetime.now(MOSCOW_TZ).strftime('%H:%M:%S')}"
     
     return notification_text
@@ -739,6 +849,10 @@ async def send_new_master_notification(context: ContextTypes.DEFAULT_TYPE, force
         # Сохраняем ID нового сообщения
         master_notification_manager.add_message_id(sent_message.message_id)
         
+        # ПОМЕЧАЕМ СООБЩЕНИЯ КАК ОБРАБОТАННЫЕ ПОСЛЕ ОТПРАВКИ УВЕДОМЛЕНИЯ
+        processed_count = await mark_messages_as_processed()
+        logger.info(f"📝 После отправки уведомления помечено {processed_count} сообщений как обработанные")
+        
         # Обновляем время последней отправки
         master_notification_manager.update_notification_time()
         
@@ -753,8 +867,15 @@ async def send_new_master_notification(context: ContextTypes.DEFAULT_TYPE, force
         return False
 
 async def check_and_send_new_notification(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет и отправляет новое уведомление каждые 15 минут"""
+    """Проверяет и отправляет новое уведомление каждые 15 минут с автоматическим обновлением статусов"""
     logger.info("🔄 Проверка необходимости отправки уведомления...")
+    
+    # СНАЧАЛА ОБНОВЛЯЕМ СТАТУСЫ ВСЕХ СООБЩЕНИЙ
+    updated_count = await update_message_funnel_statuses()
+    if updated_count > 0:
+        logger.info(f"🔄 Обновлено {updated_count} статусов воронок перед отправкой уведомления")
+    
+    # ПОТОМ ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
     await send_new_master_notification(context)
 
 # ========== ОБРАБОТЧИК ОТВЕТОВ МЕНЕДЖЕРА ==========
@@ -798,7 +919,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/managers - список менеджеров\n"
         "/stats - статистика\n"
         "/help - помощь\n"
-        "/update_notification - обновить уведомление\n\n"
+        "/update_notification - обновить уведомление\n"
+        "/force_update_funnels - принудительно обновить воронки\n"
+        "/debug_funnels - отладка воронок\n\n"
         "👥 **Управление исключениями:**\n"
         "/add_exception - добавить исключение\n"
         "/remove_exception - удалить исключение\n"
@@ -824,6 +947,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /set_funnel_2 <минуты> - установить интервал 2-й воронки  
 /set_funnel_3 <минуты> - установить интервал 3-й воронки
 /reset_funnels - сбросить настройки воронок
+/force_update_funnels - принудительно обновить статусы воронок
+/debug_funnels - отладка воронок
 
 **Рабочий чат:**
 /set_work_chat - установить этот чат как рабочий (для уведомлений)
@@ -846,10 +971,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - статистика системы
 /managers - список менеджеров
 
-📝 **Новая логика:**
-Единое уведомление обновляется автоматически каждые 15 минут
-**СТАРОЕ УДАЛЯЕТСЯ, ОТПРАВЛЯЕТСЯ НОВОЕ**
-**COOLDOWN 15 МИНУТ** - защита от частых отправок
+📝 **Логика работы воронок:**
+🟡 Воронка 1: через 1 час без ответа
+🟠 Воронка 2: через 3 часа без ответа (только после воронки 1)
+🔴 Воронка 3: через 5 часов без ответа (только после воронки 2)
+**СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ** - сообщения проходят все воронки по очереди
     """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -895,6 +1021,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🔄 **Логика уведомлений:** Удаление старого + отправка нового каждые 15 минут
 ⏳ **Cooldown:** {'✅ Активен' if not master_notification_manager.should_update() else '❌ Можно отправлять'}
+🔒 **Последовательность:** ✅ Строгая (1→2→3)
     """
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
@@ -925,11 +1052,14 @@ async def funnels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
    - Команда: `/set_funnel_3 <минуты>`
 
 🔄 Сбросить настройки: `/reset_funnels`
+🚀 Принудительное обновление: `/force_update_funnels`
+🐛 Отладка: `/debug_funnels`
 
 📝 **Логика работы:**
 Единое уведомление обновляется каждые 15 минут
 **СТАРОЕ УДАЛЯЕТСЯ, ОТПРАВЛЯЕТСЯ НОВОЕ**
 **COOLDOWN 15 МИНУТ** - защита от частых отправок
+**СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ** - сообщения проходят все воронки по очереди
     """
     
     await update.message.reply_text(funnels_text, parse_mode='Markdown')
@@ -953,8 +1083,7 @@ async def set_funnel_1_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if funnels_config.set_funnel_interval(1, minutes):
         await update.message.reply_text(f"✅ Воронка 1 установлена на {minutes} минут ({minutes_to_hours_text(minutes)})")
-        # НЕ отправляем уведомление автоматически - только по расписанию
-        logger.info("✅ Настройки воронки 1 обновлены, уведомление будет отправлено по расписанию")
+        logger.info("✅ Настройки воронки 1 обновлены")
     else:
         await update.message.reply_text("❌ Ошибка установки интервала воронки")
 
@@ -977,8 +1106,7 @@ async def set_funnel_2_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if funnels_config.set_funnel_interval(2, minutes):
         await update.message.reply_text(f"✅ Воронка 2 установлена на {minutes} минут ({minutes_to_hours_text(minutes)})")
-        # НЕ отправляем уведомление автоматически - только по расписанию
-        logger.info("✅ Настройки воронки 2 обновлены, уведомление будет отправлено по расписанию")
+        logger.info("✅ Настройки воронки 2 обновлены")
     else:
         await update.message.reply_text("❌ Ошибка установки интервала воронки")
 
@@ -1001,8 +1129,7 @@ async def set_funnel_3_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if funnels_config.set_funnel_interval(3, minutes):
         await update.message.reply_text(f"✅ Воронка 3 установлена на {minutes} минут ({minutes_to_hours_text(minutes)})")
-        # НЕ отправляем уведомление автоматически - только по расписанию
-        logger.info("✅ Настройки воронки 3 обновлены, уведомление будет отправлено по расписанию")
+        logger.info("✅ Настройки воронки 3 обновлены")
     else:
         await update.message.reply_text("❌ Ошибка установки интервала воронки")
 
@@ -1016,8 +1143,87 @@ async def reset_funnels_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     funnels_config.reset_to_default()
     await update.message.reply_text("✅ Настройки воронок сброшены к значениям по умолчанию")
-    # НЕ отправляем уведомление автоматически - только по расписанию
-    logger.info("✅ Настройки воронок сброшены, уведомление будет отправлено по расписанию")
+    logger.info("✅ Настройки воронок сброшены")
+
+async def force_update_funnels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно обновляет статусы воронок для всех сообщений"""
+    if not update or not update.message:
+        return
+        
+    if not is_admin(update.message.from_user.id):
+        await update.message.reply_text("❌ У вас нет прав для выполнения этой команды")
+        return
+    
+    await update.message.reply_text("🔄 Принудительное обновление статусов воронок...")
+    
+    updated_count = await update_message_funnel_statuses()
+    
+    if updated_count > 0:
+        await update.message.reply_text(f"✅ Обновлено статусов воронок: {updated_count} сообщений")
+        # Сразу отправляем обновленное уведомление
+        await send_new_master_notification(context, force=True)
+    else:
+        await update.message.reply_text("ℹ️ Не требуется обновление статусов воронок")
+
+async def debug_funnels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для отладки воронок"""
+    if not update or not update.message:
+        return
+        
+    if not is_admin(update.message.from_user.id):
+        await update.message.reply_text("❌ У вас нет прав для выполнения этой команды")
+        return
+    
+    # Получаем все сообщения для каждой воронки
+    FUNNELS = funnels_config.get_funnels()
+    funnel_1_messages = pending_messages_manager.get_messages_for_funnel(1, funnels_state_manager)
+    funnel_2_messages = pending_messages_manager.get_messages_for_funnel(2, funnels_state_manager)
+    funnel_3_messages = pending_messages_manager.get_messages_for_funnel(3, funnels_state_manager)
+    
+    debug_text = "🐛 **ОТЛАДКА ВОРОНОК**\n\n"
+    
+    debug_text += f"🟡 Воронка 1 ({FUNNELS[1]} мин): {len(funnel_1_messages)} сообщ.\n"
+    for msg in funnel_1_messages:
+        chat_display = get_chat_display_name(msg)
+        time_ago = format_time_ago(msg['timestamp'])
+        debug_text += f"   - {chat_display} ({time_ago} назад)\n"
+        debug_text += f"     Текст: {msg['message_text'][:50]}...\n"
+        debug_text += f"     current_funnel: {msg.get('current_funnel', 0)}, funnels_sent: {msg.get('funnels_sent', [])}\n"
+    
+    debug_text += f"\n🟠 Воронка 2 ({FUNNELS[2]} мин): {len(funnel_2_messages)} сообщ.\n"
+    for msg in funnel_2_messages:
+        chat_display = get_chat_display_name(msg)
+        time_ago = format_time_ago(msg['timestamp'])
+        debug_text += f"   - {chat_display} ({time_ago} назад)\n"
+        debug_text += f"     Текст: {msg['message_text'][:50]}...\n"
+        debug_text += f"     current_funnel: {msg.get('current_funnel', 0)}, funnels_sent: {msg.get('funnels_sent', [])}\n"
+    
+    debug_text += f"\n🔴 Воронка 3 ({FUNNELS[3]} мин): {len(funnel_3_messages)} сообщ.\n"
+    for msg in funnel_3_messages:
+        chat_display = get_chat_display_name(msg)
+        time_ago = format_time_ago(msg['timestamp'])
+        debug_text += f"   - {chat_display} ({time_ago} назад)\n"
+        debug_text += f"     Текст: {msg['message_text'][:50]}...\n"
+        debug_text += f"     current_funnel: {msg.get('current_funnel', 0)}, funnels_sent: {msg.get('funnels_sent', [])}\n"
+    
+    # Показываем статусы обработки
+    debug_text += f"\n📊 Статусы обработки:\n"
+    for funnel_num in [1, 2, 3]:
+        processed_count = len(funnels_state_manager.state.get(f"funnel_{funnel_num}_messages_processed", []))
+        debug_text += f"   Воронка {funnel_num}: {processed_count} обработано\n"
+    
+    # Показываем все pending сообщения
+    all_pending = pending_messages_manager.get_all_pending_messages()
+    debug_text += f"\n📋 Всего в pending: {len(all_pending)} сообщений\n"
+    for msg in all_pending:
+        chat_display = get_chat_display_name(msg)
+        time_ago = format_time_ago(msg['timestamp'])
+        debug_text += f"   - {chat_display} ({time_ago} назад): current_funnel={msg.get('current_funnel', 0)}, funnels_sent={msg.get('funnels_sent', [])}\n"
+    
+    if len(debug_text) > 4000:
+        debug_text = debug_text[:4000] + "\n\n... (сообщение обрезано)"
+    
+    await update.message.reply_text(debug_text, parse_mode='Markdown')
 
 async def update_notification_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для ручного обновления уведомления"""
@@ -1144,6 +1350,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💬 **Рабочий чат:** {'✅ Установлен' if work_chat_manager.is_work_chat_set() else '❌ Не установлен'}
 🔄 **Логика уведомлений:** Удаление старого + отправка нового каждые 15 минут
 ⏳ **Cooldown:** {'✅ Активен' if not master_notification_manager.should_update() else '❌ Можно отправлять'}
+🔒 **Последовательность:** ✅ Строгая (1→2→3)
 🕐 **Текущее время:** {now.strftime('%H:%M:%S')}
     """
     
@@ -1163,6 +1370,17 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Нет непрочитанных сообщений")
         return
     
+    # ОТЛАДОЧНАЯ ИНФОРМАЦИЯ - показываем статусы воронок
+    FUNNELS = funnels_config.get_funnels()
+    funnel_1_count = len(pending_messages_manager.get_messages_for_funnel(1, funnels_state_manager))
+    funnel_2_count = len(pending_messages_manager.get_messages_for_funnel(2, funnels_state_manager))
+    funnel_3_count = len(pending_messages_manager.get_messages_for_funnel(3, funnels_state_manager))
+    
+    debug_info = f"\n🔍 **ОТЛАДКА ВОРОНОК:**\n"
+    debug_info += f"🟡 Воронка 1 ({FUNNELS[1]} мин): {funnel_1_count} сообщ.\n"
+    debug_info += f"🟠 Воронка 2 ({FUNNELS[2]} мин): {funnel_2_count} сообщ.\n"  
+    debug_info += f"🔴 Воронка 3 ({FUNNELS[3]} мин): {funnel_3_count} сообщ.\n\n"
+    
     chats_messages = {}
     for message in all_pending:
         chat_id = message['chat_id']
@@ -1170,7 +1388,8 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chats_messages[chat_id] = []
         chats_messages[chat_id].append(message)
     
-    pending_text = f"📋 **НЕПРОЧИТАННЫЕ СООБЩЕНИЯ**\n\nВсего сообщений: {len(all_pending)}\nЧатов: {len(chats_messages)}\n\n"
+    pending_text = f"📋 **НЕПРОЧИТАННЫЕ СООБЩЕНИЯ**\n\nВсего сообщений: {len(all_pending)}\nЧатов: {len(chats_messages)}\n"
+    pending_text += debug_info
     
     for i, (chat_id, messages) in enumerate(chats_messages.items(), 1):
         chat_display = get_chat_display_name(messages[0])
@@ -1181,10 +1400,18 @@ async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_funnel = max([msg.get('current_funnel', 0) for msg in messages])
         funnel_emoji = get_funnel_emoji(current_funnel) if current_funnel > 0 else "⚪"
         
+        # Показываем детальную информацию о воронках для этого чата
+        funnel_details = []
+        for msg in messages:
+            funnel_num = msg.get('current_funnel', 0)
+            funnels_sent = msg.get('funnels_sent', [])
+            funnel_details.append(f"{funnel_num}({','.join(map(str, funnels_sent))})")
+        
         pending_text += f"{i}. {chat_display} {funnel_emoji}\n"
         pending_text += f"   📝 Сообщений: {len(messages)}\n"
         pending_text += f"   ⏰ Самое старое: {time_ago} назад\n"
-        pending_text += f"   🚀 Текущая воронка: {current_funnel}\n\n"
+        pending_text += f"   🚀 Текущая воронка: {current_funnel}\n"
+        pending_text += f"   🔧 Статусы: {', '.join(funnel_details)}\n\n"
     
     if len(pending_text) > 4000:
         pending_text = pending_text[:4000] + "\n\n... (сообщение обрезано)"
@@ -1204,8 +1431,7 @@ async def clear_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if removed_count > 0:
         await update.message.reply_text(f"✅ Удалено {removed_count} сообщений из этого чата")
-        # НЕ отправляем уведомление автоматически - только по расписанию
-        logger.info(f"✅ Удалены сообщения из чата {chat_id}, уведомление будет отправлено по расписанию")
+        logger.info(f"✅ Удалены сообщения из чата {chat_id}")
     else:
         await update.message.reply_text("✅ В этом чате нет непрочитанных сообщений")
 
@@ -1219,8 +1445,7 @@ async def clear_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     removed_count = pending_messages_manager.clear_all()
     await update.message.reply_text(f"✅ Удалены все непрочитанные сообщения ({removed_count} шт.)")
-    # НЕ отправляем уведомление автоматически - только по расписанию
-    logger.info("✅ Все сообщения очищены, уведомление будет отправлено по расписанию")
+    logger.info("✅ Все сообщения очищены")
 
 # ========== КОМАНДЫ УПРАВЛЕНИЯ ИСКЛЮЧЕНИЯМИ ==========
 
@@ -1446,6 +1671,8 @@ def main():
         application.add_handler(CommandHandler("set_funnel_2", set_funnel_2_command))
         application.add_handler(CommandHandler("set_funnel_3", set_funnel_3_command))
         application.add_handler(CommandHandler("reset_funnels", reset_funnels_command))
+        application.add_handler(CommandHandler("force_update_funnels", force_update_funnels_command))
+        application.add_handler(CommandHandler("debug_funnels", debug_funnels_command))
         
         # Команды для обновления уведомления
         application.add_handler(CommandHandler("update_notification", update_notification_command))
@@ -1490,6 +1717,8 @@ def main():
             job_queue.run_repeating(check_and_send_new_notification, interval=900, first=10)  # 15 минут
             print("✅ Планировщик задач запущен (удаление старого + отправка нового каждые 15 минут)")
             print("🛡️  COOLDOWN АКТИВИРОВАН - защита от частых отправок")
+            print("🔒 СТРОГАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ - сообщения проходят воронки 1→2→3")
+            print("✅ АВТОМАТИЧЕСКАЯ ОТМЕТКА - сообщения помечаются как обработанные после отправки")
         else:
             print("❌ Планировщик задач недоступен")
         
@@ -1511,6 +1740,8 @@ def main():
         
         print("🔄 Логика уведомлений: УДАЛЕНИЕ СТАРОГО + ОТПРАВКА НОВОГО каждые 15 минут")
         print("⏳ COOLDOWN: 15 минут между отправками")
+        print("🔒 ПОСЛЕДОВАТЕЛЬНОСТЬ: строгая 1→2→3")
+        print("✅ ОТМЕТКА: сообщения помечаются как обработанные после отправки")
         print("⏰ Ожидание сообщений...")
         print("=" * 50)
         
